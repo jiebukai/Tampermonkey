@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单自动转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.2.0
+// @version      1.3.0
 // @description  勾选工单后，按规则表自动匹配处理人员，一键完成批量转派
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
@@ -81,6 +81,19 @@
     { center: '焦作云中心', primary: 'lixinyong', backup: 'yulei08' },
     { center: '周口云中心', primary: 'lvbenke', backup: 'lixinyong' },
   ];
+
+  /** 账号 → 姓名（配置页显示用） */
+  const PEOPLE = {
+    lixinyong: '李新勇',
+    lvbenke: '吕本科',
+    huangchao01: '黄超',
+    lishuangfeng: '李双凤',
+    yulei08: '于雷',
+    tanglei01: '唐磊',
+  };
+
+  /** 显示成「姓名（账号）」，未知账号原样返回 */
+  const displayName = (account) => (PEOPLE[account] ? `${PEOPLE[account]}（${account}）` : account);
 
   const CONFIG = {
     // 转派时填入「处理描述」的固定内容
@@ -242,6 +255,25 @@
     } catch (e) { /* 隐私模式等场景忽略 */ }
   }
 
+  const OVERRIDES_KEY = 'css-auto-transfer-overrides';
+
+  /** 手动指派：{ 云中心: 账号 }，优先级高于 CENTERS 表 */
+  let overrides = {};
+  try {
+    const saved = JSON.parse(localStorage.getItem(OVERRIDES_KEY) || '{}');
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      overrides = Object.fromEntries(
+        Object.entries(saved).filter(([, v]) => typeof v === 'string' && v)
+      );
+    }
+  } catch (e) { /* 存储损坏时按无指派处理 */ }
+
+  function saveOverrides() {
+    try {
+      localStorage.setItem(OVERRIDES_KEY, JSON.stringify(overrides));
+    } catch (e) { /* 隐私模式等场景忽略 */ }
+  }
+
   /** 规则表里出现过的所有主岗人员及其负责的云中心列表（按首次出现顺序） */
   function primaryUsers() {
     const map = new Map();
@@ -267,6 +299,10 @@
    * 主岗启用 -> 主岗；主岗停用 -> 该云中心的备岗；都没有 -> null
    */
   function resolveTarget(row) {
+    const center = (row['云中心'] || '').trim();
+    const manual = center && overrides[center];
+    if (manual) return { user: manual, manual: true };
+
     const primary = matchUser(row);
     if (!primary) return { user: null, reason: 'no-rule' };
 
@@ -345,6 +381,16 @@
         .cfg-row .u { font-weight: 600; min-width: 96px; }
         .cfg-row .meta { color: #888; font-size: 12px; }
         .cfg-row.off .u { color: #bbb; text-decoration: line-through; }
+        #cfgDialog .tabs { display: flex; gap: 4px; padding: 8px 20px 0; border-bottom: 1px solid #f0f0f0; }
+        #cfgDialog .tab {
+          padding: 8px 14px; border: 0; background: transparent; cursor: pointer; font-size: 14px;
+          color: #888; border-bottom: 2px solid transparent; margin-bottom: -1px;
+        }
+        #cfgDialog .tab.active { color: #1677ff; border-bottom-color: #1677ff; }
+        .center-row { display: flex; align-items: center; gap: 8px; padding: 8px 4px; border-bottom: 1px solid #f5f5f5; }
+        .center-row .c { flex: 1; font-size: 13px; }
+        .center-row select { max-width: 210px; padding: 4px 6px; font-size: 12px; border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; }
+        .center-row.manual .c { color: #1677ff; font-weight: 600; }
         .hint { color: #888; margin: 0 0 10px; font-size: 12px; line-height: 1.6; }
         #toast {
           position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
@@ -370,10 +416,20 @@
       </div>
       <div id="cfgMask">
         <div id="cfgDialog">
-          <h3>主备岗配置</h3>
+          <h3>配置</h3>
+          <div class="tabs">
+            <button class="tab active" data-tab="people">人员开关</button>
+            <button class="tab" data-tab="centers">云中心指派</button>
+          </div>
           <div class="body">
-            <p class="hint">取消勾选即停用该主岗，其负责的工单会转给对应云中心的备岗。开关状态保存在本浏览器。</p>
-            <div id="cfgList"></div>
+            <div id="tabPeople">
+              <p class="hint">取消勾选即停用该主岗，其负责的工单会转给对应云中心的备岗。</p>
+              <div id="cfgList"></div>
+            </div>
+            <div id="tabCenters" hidden>
+              <p class="hint">手动指定某云中心的处理人，优先级高于表格里的主/备岗。</p>
+              <div id="cfgCenters"></div>
+            </div>
           </div>
           <div class="actions">
             <button id="cfgClose" class="primary">关闭</button>
@@ -390,6 +446,9 @@
     fab.addEventListener('click', onRun);
     shadow.getElementById('cfg').addEventListener('click', openConfig);
     shadow.getElementById('cfgClose').addEventListener('click', () => cfgBox.classList.remove('show'));
+    shadow.querySelectorAll('#cfgDialog .tab').forEach((tab) => {
+      tab.addEventListener('click', () => switchTab(tab.dataset.tab));
+    });
     shadow.getElementById('cancel').addEventListener('click', () => closeConfirm(false));
     shadow.getElementById('ok').addEventListener('click', () => closeConfirm(true));
   }
@@ -415,11 +474,21 @@
 
   function openConfig() {
     ensureUI();
-    renderConfig();
+    renderPeople();
+    renderCenters();
+    switchTab('people');
     cfgBox.classList.add('show');
   }
 
-  function renderConfig() {
+  function switchTab(name) {
+    shadow.querySelectorAll('#cfgDialog .tab').forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.tab === name);
+    });
+    shadow.getElementById('tabPeople').hidden = name !== 'people';
+    shadow.getElementById('tabCenters').hidden = name !== 'centers';
+  }
+
+  function renderPeople() {
     const list = shadow.getElementById('cfgList');
     const users = primaryUsers();
 
@@ -436,7 +505,7 @@
       return `
         <label class="cfg-row ${enabled ? '' : 'off'}" data-user="${escapeHtml(user)}">
           <input type="checkbox" ${enabled ? 'checked' : ''}>
-          <span class="u">${escapeHtml(user)}</span>
+          <span class="u">${escapeHtml(displayName(user))}</span>
           <span class="meta">${escapeHtml(meta)}</span>
         </label>`;
     }).join('');
@@ -453,17 +522,54 @@
 
         const entry = users.find((u) => u.user === user) || { centers: [] };
         if (cb.checked) {
-          toast(`${user} 已启用`);
+          toast(`${displayName(user)} 已启用`);
         } else if (!entry.centers.length) {
-          toast(`${user} 已停用`, false);
+          toast(`${displayName(user)} 已停用`);
         } else {
           const noBackup = entry.centers.filter((c) => !findBackup(c));
           if (noBackup.length) {
-            toast(`${user} 已停用；${noBackup.length} 个云中心没有备岗，相关工单会在执行前被拦下`, true);
+            toast(`${displayName(user)} 已停用；${noBackup.length} 个云中心没有备岗，相关工单会在执行前被拦下`, true);
           } else {
-            toast(`${user} 已停用，其 ${entry.centers.length} 个云中心的工单将转给各自备岗`);
+            toast(`${displayName(user)} 已停用，其 ${entry.centers.length} 个云中心的工单将转给各自备岗`);
           }
         }
+      });
+    });
+  }
+
+  function renderCenters() {
+    const list = shadow.getElementById('cfgCenters');
+    const accounts = [...new Set([
+      ...Object.keys(PEOPLE),
+      ...CENTERS.flatMap((c) => [c.primary, c.backup]),
+    ])];
+
+    list.innerHTML = CENTERS.map((c) => {
+      const current = overrides[c.center] || '';
+      const options = accounts.map((acc) =>
+        `<option value="${escapeHtml(acc)}" ${current === acc ? 'selected' : ''}>${escapeHtml(displayName(acc))}</option>`
+      ).join('');
+      return `
+        <div class="center-row ${current ? 'manual' : ''}" data-center="${escapeHtml(c.center)}">
+          <span class="c">${escapeHtml(c.center)}</span>
+          <select>
+            <option value="">跟随规则（${escapeHtml(displayName(c.primary))}）</option>
+            ${options}
+          </select>
+        </div>`;
+    }).join('');
+
+    list.querySelectorAll('.center-row').forEach((row) => {
+      const center = row.dataset.center;
+      const sel = row.querySelector('select');
+      sel.addEventListener('change', () => {
+        if (sel.value) overrides[center] = sel.value;
+        else delete overrides[center];
+        saveOverrides();
+        row.classList.toggle('manual', !!sel.value);
+        toast(sel.value
+          ? `${center} 已手动指派给 ${displayName(sel.value)}`
+          : `${center} 已恢复按规则转派`);
       });
     });
   }
@@ -604,7 +710,7 @@
     for (const row of rows) {
       const target = resolveTarget(row);
       if (target.user) {
-        plan.push({ row, user: target.user, fallback: !!target.fallback, primary: target.primary });
+        plan.push({ row, user: target.user, fallback: !!target.fallback, primary: target.primary, manual: !!target.manual });
       } else {
         missing.push({ row, reason: target.reason, primary: target.primary });
       }
@@ -639,12 +745,12 @@
       <tr>
         <td>${escapeHtml(p.row.__id)}</td>
         <td>${escapeHtml(p.row.__title)}</td>
-        <td>${escapeHtml(p.user)}${p.fallback ? '（备岗）' : ''}</td>
+        <td>${escapeHtml(displayName(p.user))}${p.manual ? '（手动指派）' : p.fallback ? '（备岗）' : ''}</td>
       </tr>
     `).join('');
 
     const groupSummary = [...groups.entries()]
-      .map(([user, items]) => `<li>${escapeHtml(user)}：${items.length} 张</li>`)
+      .map(([user, items]) => `<li>${escapeHtml(displayName(user))}：${items.length} 张</li>`)
       .join('');
 
     const html = `
