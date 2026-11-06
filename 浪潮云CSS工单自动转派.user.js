@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单自动转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.0.1
+// @version      1.1.0
 // @description  勾选工单后，按规则表自动匹配处理人员，一键完成批量转派
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
@@ -36,6 +36,15 @@
       { match: { '云中心': '四川省直云中心' }, user: 'yinhang01' },
       // { match: { '工单标题': '网络' }, user: 'zhangsan' },
       // { match: { '一级分类': /派工单|中心需求/ }, user: 'lisi' },
+    ],
+
+    /**
+     * 主备岗：主岗被停用时，该云中心的工单改派给备岗。
+     * center 与工单「云中心」列做包含匹配。
+     */
+    backups: [
+      { center: '四川省直云中心', user: 'jindengke' },
+      { center: '重庆云中心', user: 'yujingming' },
     ],
 
     // 有工单未命中规则时：'stop' 中止整批 / 'skip' 跳过未命中的
@@ -169,12 +178,63 @@
     return null;
   }
 
+  /* ========================= 主备岗状态 ========================= */
+
+  const DISABLED_KEY = 'css-auto-transfer-disabled-users';
+
+  let disabledUsers = new Set();
+  try {
+    const saved = JSON.parse(localStorage.getItem(DISABLED_KEY) || '[]');
+    if (Array.isArray(saved)) disabledUsers = new Set(saved.filter((x) => typeof x === 'string'));
+  } catch (e) { /* 存储损坏时按全部启用处理 */ }
+
+  function saveDisabledUsers() {
+    try {
+      localStorage.setItem(DISABLED_KEY, JSON.stringify([...disabledUsers]));
+    } catch (e) { /* 隐私模式等场景忽略 */ }
+  }
+
+  /** 规则表里出现过的所有主岗人员及其负责的云中心（按首次出现顺序去重） */
+  function primaryUsers() {
+    const map = new Map();
+    for (const rule of CONFIG.rules) {
+      if (!rule || !rule.user) continue;
+      if (!map.has(rule.user)) {
+        const center = rule.match && typeof rule.match['云中心'] === 'string' ? rule.match['云中心'] : '';
+        map.set(rule.user, center);
+      }
+    }
+    return [...map.entries()].map(([user, center]) => ({ user, center }));
+  }
+
+  function findBackup(center) {
+    if (!center) return null;
+    const hit = (CONFIG.backups || []).find((b) => b && center.includes(b.center));
+    return hit ? hit.user : null;
+  }
+
+  /**
+   * 决定一张工单该转给谁。
+   * 主岗启用 -> 主岗；主岗停用 -> 该云中心的备岗；都没有 -> null
+   */
+  function resolveTarget(row) {
+    const primary = matchUser(row);
+    if (!primary) return { user: null, reason: 'no-rule' };
+
+    if (!disabledUsers.has(primary)) return { user: primary, primary, fallback: false };
+
+    const backup = findBackup(row['云中心'] || '');
+    if (!backup) return { user: null, reason: 'no-backup', primary };
+    return { user: backup, primary, fallback: true };
+  }
+
   /* ============================== UI ============================== */
 
   let host = null;
   let shadow = null;
   let fab = null;
   let confirmBox = null;
+  let cfgBox = null;
   let toastEl = null;
   let running = false;
 
@@ -189,6 +249,12 @@
       <style>
         :host { all: initial; }
         * { box-sizing: border-box; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+        #dock { display: flex; align-items: center; gap: 8px; }
+        #cfg {
+          padding: 10px 14px; border: 0; border-radius: 22px; background: #fff; color: #333;
+          font-size: 14px; cursor: pointer; box-shadow: 0 4px 14px rgba(0, 0, 0, .18);
+        }
+        #cfg:hover { background: #f5f5f5; }
         #fab {
           display: none; padding: 10px 18px; border: 0; border-radius: 22px;
           background: #1677ff; color: #fff; font-size: 14px; cursor: pointer;
@@ -196,31 +262,41 @@
         }
         #fab:hover { background: #4096ff; }
         #fab[disabled] { background: #8fbcf7; cursor: not-allowed; }
-        #mask {
+        #mask, #cfgMask {
           position: fixed; inset: 0; background: rgba(0, 0, 0, .45);
           display: none; align-items: center; justify-content: center; z-index: 10;
         }
-        #mask.show { display: flex; }
-        #dialog {
+        #mask.show, #cfgMask.show { display: flex; }
+        #dialog, #cfgDialog {
           width: 520px; max-height: 76vh; background: #fff; border-radius: 8px;
           display: flex; flex-direction: column; overflow: hidden;
           box-shadow: 0 8px 30px rgba(0, 0, 0, .2);
         }
-        #dialog h3 { margin: 0; padding: 16px 20px; font-size: 16px; border-bottom: 1px solid #f0f0f0; }
-        #dialog .body { padding: 14px 20px; overflow: auto; font-size: 13px; color: #333; }
-        #dialog .body table { width: 100%; border-collapse: collapse; }
-        #dialog .body th, #dialog .body td {
+        #dialog h3, #cfgDialog h3 { margin: 0; padding: 16px 20px; font-size: 16px; border-bottom: 1px solid #f0f0f0; }
+        #dialog .body, #cfgDialog .body { padding: 14px 20px; overflow: auto; font-size: 13px; color: #333; }
+        #dialog .body table, #cfgDialog .body table { width: 100%; border-collapse: collapse; }
+        #dialog .body th, #dialog .body td,
+        #cfgDialog .body th, #cfgDialog .body td {
           text-align: left; padding: 6px 8px; border-bottom: 1px solid #f5f5f5; vertical-align: top;
         }
-        #dialog .body th { color: #888; font-weight: 400; white-space: nowrap; }
-        #dialog .warn { color: #d4380d; }
-        #dialog .actions { padding: 12px 20px; border-top: 1px solid #f0f0f0; text-align: right; }
-        #dialog .actions button {
+        #dialog .body th, #cfgDialog .body th { color: #888; font-weight: 400; white-space: nowrap; }
+        #dialog .warn, #cfgDialog .warn { color: #d4380d; }
+        #dialog .actions, #cfgDialog .actions { padding: 12px 20px; border-top: 1px solid #f0f0f0; text-align: right; }
+        #dialog .actions button, #cfgDialog .actions button {
           padding: 6px 16px; margin-left: 8px; border-radius: 4px; font-size: 14px; cursor: pointer;
           border: 1px solid #d9d9d9; background: #fff; color: #333;
         }
-        #dialog .actions button.primary { background: #1677ff; border-color: #1677ff; color: #fff; }
+        #dialog .actions button.primary, #cfgDialog .actions button.primary { background: #1677ff; border-color: #1677ff; color: #fff; }
         #dialog .actions button[disabled] { opacity: .5; cursor: not-allowed; }
+        .cfg-row {
+          display: flex; align-items: center; gap: 10px; padding: 10px 4px;
+          border-bottom: 1px solid #f5f5f5; cursor: pointer;
+        }
+        .cfg-row input { width: 16px; height: 16px; cursor: pointer; }
+        .cfg-row .u { font-weight: 600; min-width: 96px; }
+        .cfg-row .meta { color: #888; font-size: 12px; }
+        .cfg-row.off .u { color: #bbb; text-decoration: line-through; }
+        .hint { color: #888; margin: 0 0 10px; font-size: 12px; line-height: 1.6; }
         #toast {
           position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
           max-width: 70vw; padding: 10px 16px; border-radius: 6px; font-size: 13px;
@@ -229,7 +305,10 @@
         #toast.show { display: block; }
         #toast.err { background: #d4380d; }
       </style>
-      <button id="fab">自动转派</button>
+      <div id="dock">
+        <button id="cfg" title="主备岗配置">⚙ 配置</button>
+        <button id="fab">自动转派</button>
+      </div>
       <div id="mask">
         <div id="dialog">
           <h3>确认自动转派</h3>
@@ -240,13 +319,28 @@
           </div>
         </div>
       </div>
+      <div id="cfgMask">
+        <div id="cfgDialog">
+          <h3>主备岗配置</h3>
+          <div class="body">
+            <p class="hint">取消勾选即停用该主岗，其负责的工单会转给对应云中心的备岗。开关状态保存在本浏览器。</p>
+            <div id="cfgList"></div>
+          </div>
+          <div class="actions">
+            <button id="cfgClose" class="primary">关闭</button>
+          </div>
+        </div>
+      </div>
       <div id="toast"></div>
     `;
     fab = shadow.getElementById('fab');
     confirmBox = shadow.getElementById('mask');
+    cfgBox = shadow.getElementById('cfgMask');
     toastEl = shadow.getElementById('toast');
 
     fab.addEventListener('click', onRun);
+    shadow.getElementById('cfg').addEventListener('click', openConfig);
+    shadow.getElementById('cfgClose').addEventListener('click', () => cfgBox.classList.remove('show'));
     shadow.getElementById('cancel').addEventListener('click', () => closeConfirm(false));
     shadow.getElementById('ok').addEventListener('click', () => closeConfirm(true));
   }
@@ -268,6 +362,55 @@
   function closeConfirm(value) {
     confirmBox.classList.remove('show');
     if (confirmResolve) { confirmResolve(value); confirmResolve = null; }
+  }
+
+  function openConfig() {
+    ensureUI();
+    renderConfig();
+    cfgBox.classList.add('show');
+  }
+
+  function renderConfig() {
+    const list = shadow.getElementById('cfgList');
+    const users = primaryUsers();
+
+    if (!users.length) {
+      list.innerHTML = '<p class="hint">规则表里还没有配置任何人员。</p>';
+      return;
+    }
+
+    list.innerHTML = users.map(({ user, center }) => {
+      const backup = findBackup(center);
+      const enabled = !disabledUsers.has(user);
+      return `
+        <label class="cfg-row ${enabled ? '' : 'off'}" data-user="${escapeHtml(user)}">
+          <input type="checkbox" ${enabled ? 'checked' : ''}>
+          <span class="u">${escapeHtml(user)}</span>
+          <span class="meta">${escapeHtml(center || '未限定云中心')} · 备岗：${escapeHtml(backup || '未配置')}</span>
+        </label>`;
+    }).join('');
+
+    list.querySelectorAll('.cfg-row').forEach((row) => {
+      const cb = row.querySelector('input');
+      cb.addEventListener('change', () => {
+        const user = row.dataset.user;
+        if (cb.checked) disabledUsers.delete(user);
+        else disabledUsers.add(user);
+        saveDisabledUsers();
+        row.classList.toggle('off', !cb.checked);
+        updateFab();
+
+        const center = (users.find((u) => u.user === user) || {}).center || '';
+        const backup = findBackup(center);
+        if (cb.checked) {
+          toast(`${user} 已启用`);
+        } else if (backup) {
+          toast(`${user} 已停用，其工单将转给备岗 ${backup}`);
+        } else {
+          toast(`${user} 已停用，但云中心「${center || '未知'}」没有配置备岗`, true);
+        }
+      });
+    });
   }
 
   function toast(msg, isError = false) {
@@ -404,17 +547,26 @@
     const plan = [];
     const missing = [];
     for (const row of rows) {
-      const user = matchUser(row);
-      if (user) plan.push({ row, user });
-      else missing.push(row);
+      const target = resolveTarget(row);
+      if (target.user) {
+        plan.push({ row, user: target.user, fallback: !!target.fallback, primary: target.primary });
+      } else {
+        missing.push({ row, reason: target.reason, primary: target.primary });
+      }
     }
 
     if (missing.length) {
-      const list = missing.map((r) => `<li>${escapeHtml(r.__id)} ${escapeHtml(r.__title)}</li>`).join('');
+      const list = missing.map((m) => {
+        const head = `${escapeHtml(m.row.__id)} ${escapeHtml(m.row.__title)}`;
+        if (m.reason === 'no-backup') {
+          return `<li>${head} —— 主岗 ${escapeHtml(m.primary)} 已停用，但云中心「${escapeHtml(m.row['云中心'] || '未知')}」没有配置备岗</li>`;
+        }
+        return `<li>${head} —— 未命中任何规则</li>`;
+      }).join('');
       const html = `
-        <p class="warn">以下 ${missing.length} 张工单没有命中任何规则：</p>
+        <p class="warn">以下 ${missing.length} 张工单无法确定处理人员：</p>
         <ul>${list}</ul>
-        <p>请在脚本配置区的 rules 中补充对照关系后再试。</p>
+        <p>请在脚本配置区的 rules / backups 中补充后再试。</p>
       `;
       await openConfirm(html, { showOk: false, cancelText: '知道了' });
       return;
@@ -432,7 +584,7 @@
       <tr>
         <td>${escapeHtml(p.row.__id)}</td>
         <td>${escapeHtml(p.row.__title)}</td>
-        <td>${escapeHtml(p.user)}</td>
+        <td>${escapeHtml(p.user)}${p.fallback ? '（备岗）' : ''}</td>
       </tr>
     `).join('');
 
