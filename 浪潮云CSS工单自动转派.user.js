@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单自动转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.1.0
+// @version      1.2.0
 // @description  勾选工单后，按规则表自动匹配处理人员，一键完成批量转派
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
@@ -18,34 +18,79 @@
 
   /* ======================= 配置区（按需修改） ======================= */
 
+  /**
+   * 云中心 → 主岗 / 备岗（账号）。
+   * 主岗启用时转给主岗；在配置面板取消勾选后，该云中心的工单转给备岗。
+   * 新增云中心只需在这里加一行。
+   */
+  const CENTERS = [
+    { center: '北京大族云中心', primary: 'lixinyong', backup: 'huangchao01' },
+    { center: '黑龙江省直云中心', primary: 'lixinyong', backup: 'huangchao01' },
+    { center: '哈尔滨云中心', primary: 'lvbenke', backup: 'lishuangfeng' },
+    { center: '佳木斯云中心', primary: 'huangchao01', backup: 'lixinyong' },
+    { center: '牡丹江云中心', primary: 'lishuangfeng', backup: 'huangchao01' },
+    { center: '齐齐哈尔云中心', primary: 'lishuangfeng', backup: 'huangchao01' },
+    { center: '保定云中心', primary: 'lishuangfeng', backup: 'huangchao01' },
+    { center: '石家庄云中心', primary: 'lishuangfeng', backup: 'lvbenke' },
+    { center: '张家口云中心', primary: 'lishuangfeng', backup: 'lvbenke' },
+    { center: '晋中云中心', primary: 'huangchao01', backup: 'lixinyong' },
+    { center: '长治云中心', primary: 'lixinyong', backup: 'lvbenke' },
+    { center: '临汾云中心', primary: 'lvbenke', backup: 'lixinyong' },
+    { center: '运城云中心', primary: 'lixinyong', backup: 'lishuangfeng' },
+    { center: '忻州云中心', primary: 'huangchao01', backup: 'lishuangfeng' },
+    { center: '朔州云中心', primary: 'lishuangfeng', backup: 'lixinyong' },
+    { center: '呼和浩特云中心', primary: 'lixinyong', backup: 'lishuangfeng' },
+    { center: '乌海云中心', primary: 'lishuangfeng', backup: 'lixinyong' },
+    { center: '泰州云中心', primary: 'lixinyong', backup: 'lvbenke' },
+    { center: '吴中云中心', primary: 'huangchao01', backup: 'lvbenke' },
+    { center: '安徽省直云中心', primary: 'lvbenke', backup: 'yulei08' },
+    { center: '阜阳云中心', primary: 'lixinyong', backup: 'yulei08' },
+    { center: '亳州云中心', primary: 'yulei08', backup: 'lixinyong' },
+    { center: '宿州云中心', primary: 'lishuangfeng', backup: 'yulei08' },
+    { center: '宣城云中心', primary: 'lixinyong', backup: 'lvbenke' },
+    { center: '铜陵云中心', primary: 'yulei08', backup: 'lvbenke' },
+    { center: '鹰潭云中心', primary: 'huangchao01', backup: 'yulei08' },
+    { center: '抚州云中心', primary: 'yulei08', backup: 'huangchao01' },
+    { center: '宜春云中心', primary: 'lvbenke', backup: 'yulei08' },
+    { center: '南平云中心', primary: 'yulei08', backup: 'lishuangfeng' },
+    { center: '厦门云中心', primary: 'lishuangfeng', backup: 'yulei08' },
+    { center: '海南省直云中心', primary: 'yulei08', backup: 'lishuangfeng' },
+    { center: '静安云中心', primary: 'lvbenke', backup: 'lishuangfeng' },
+    { center: '四川省直云中心', primary: 'lvbenke', backup: 'yulei08' },
+    { center: '成都云中心', primary: 'yulei08', backup: 'lvbenke' },
+    { center: '绵阳云中心', primary: 'lvbenke', backup: 'huangchao01' },
+    { center: '宜宾云中心', primary: 'lvbenke', backup: 'huangchao01' },
+    { center: '巴中云中心', primary: 'yulei08', backup: 'huangchao01' },
+    { center: '乐山云中心', primary: 'huangchao01', backup: 'lvbenke' },
+    { center: '自贡云中心', primary: 'lvbenke', backup: 'huangchao01' },
+    { center: '酒泉云中心', primary: 'huangchao01', backup: 'lishuangfeng' },
+    { center: '乌鲁木齐云中心', primary: 'lishuangfeng', backup: 'lvbenke' },
+    { center: '克拉玛依云中心', primary: 'yulei08', backup: 'lvbenke' },
+    { center: '重庆云中心', primary: 'lishuangfeng', backup: 'yulei08' },
+    { center: '昆明云中心', primary: 'huangchao01', backup: 'yulei08' },
+    { center: '昆明呈贡云中心', primary: 'huangchao01', backup: 'yulei08' },
+    { center: '西双版纳云中心', primary: 'yulei08', backup: 'huangchao01' },
+    { center: '广西省直云中心', primary: 'lishuangfeng', backup: 'lixinyong' },
+    { center: '河池云中心', primary: 'yulei08', backup: 'lishuangfeng' },
+    { center: '防城港云中心', primary: 'lixinyong', backup: 'huangchao01' },
+    { center: '长沙云中心', primary: 'lvbenke', backup: 'lishuangfeng' },
+    { center: '孝感云中心', primary: 'lixinyong', backup: 'huangchao01' },
+    { center: '黄冈云中心', primary: 'yulei08', backup: 'lixinyong' },
+    { center: '武昌智算中心', primary: 'lixinyong', backup: 'yulei08' },
+    { center: '郑州云中心', primary: 'lvbenke', backup: 'lixinyong' },
+    { center: '焦作云中心', primary: 'lixinyong', backup: 'yulei08' },
+    { center: '周口云中心', primary: 'lvbenke', backup: 'lixinyong' },
+  ];
+
   const CONFIG = {
     // 转派时填入「处理描述」的固定内容
     description: '请老师处理',
 
-    /**
-     * 人员对照表：从上到下匹配，命中第一条即停止。
-     * match 的 key 必须与表格表头文字完全一致（见工单列表列名），
-     * value 支持：
-     *   - 字符串：列值「包含」该字符串即命中
-     *   - 正则：列值需匹配该正则
-     * 多列条件为「且」关系。
-     */
-    rules: [
-      // 示例规则：请改成你自己的对照表
-      { match: { '云中心': '重庆云中心' }, user: 'malei07' },
-      { match: { '云中心': '四川省直云中心' }, user: 'yinhang01' },
-      // { match: { '工单标题': '网络' }, user: 'zhangsan' },
-      // { match: { '一级分类': /派工单|中心需求/ }, user: 'lisi' },
-    ],
+    // 由 CENTERS 自动生成：云中心 → 主岗（云中心按全等匹配）
+    rules: CENTERS.map((c) => ({ match: { '云中心': c.center }, user: c.primary })),
 
-    /**
-     * 主备岗：主岗被停用时，该云中心的工单改派给备岗。
-     * center 与工单「云中心」列做包含匹配。
-     */
-    backups: [
-      { center: '四川省直云中心', user: 'jindengke' },
-      { center: '重庆云中心', user: 'yujingming' },
-    ],
+    // 由 CENTERS 自动生成：云中心 → 备岗
+    backups: CENTERS.map((c) => ({ center: c.center, user: c.backup })),
 
     // 有工单未命中规则时：'stop' 中止整批 / 'skip' 跳过未命中的
     onNoMatch: 'stop',
@@ -166,9 +211,12 @@
       if (!rule || !rule.user || !rule.match) continue;
       let hit = true;
       for (const [col, expect] of Object.entries(rule.match)) {
-        const val = row[col] == null ? '' : String(row[col]);
+        const val = (row[col] == null ? '' : String(row[col])).trim();
         if (expect instanceof RegExp) {
           if (!expect.test(val)) { hit = false; break; }
+        } else if (col === '云中心') {
+          // 云中心名称存在包含关系（昆明云中心 / 昆明呈贡云中心），必须全等
+          if (val !== String(expect)) { hit = false; break; }
         } else if (!val.includes(String(expect))) {
           hit = false; break;
         }
@@ -194,22 +242,23 @@
     } catch (e) { /* 隐私模式等场景忽略 */ }
   }
 
-  /** 规则表里出现过的所有主岗人员及其负责的云中心（按首次出现顺序去重） */
+  /** 规则表里出现过的所有主岗人员及其负责的云中心列表（按首次出现顺序） */
   function primaryUsers() {
     const map = new Map();
     for (const rule of CONFIG.rules) {
       if (!rule || !rule.user) continue;
-      if (!map.has(rule.user)) {
-        const center = rule.match && typeof rule.match['云中心'] === 'string' ? rule.match['云中心'] : '';
-        map.set(rule.user, center);
-      }
+      const center = rule.match && typeof rule.match['云中心'] === 'string' ? rule.match['云中心'] : '';
+      if (!map.has(rule.user)) map.set(rule.user, { user: rule.user, centers: [] });
+      const entry = map.get(rule.user);
+      if (center && !entry.centers.includes(center)) entry.centers.push(center);
     }
-    return [...map.entries()].map(([user, center]) => ({ user, center }));
+    return [...map.values()];
   }
 
   function findBackup(center) {
-    if (!center) return null;
-    const hit = (CONFIG.backups || []).find((b) => b && center.includes(b.center));
+    const name = (center || '').trim();
+    if (!name) return null;
+    const hit = (CONFIG.backups || []).find((b) => b && b.center === name);
     return hit ? hit.user : null;
   }
 
@@ -379,14 +428,16 @@
       return;
     }
 
-    list.innerHTML = users.map(({ user, center }) => {
-      const backup = findBackup(center);
+    list.innerHTML = users.map(({ user, centers }) => {
       const enabled = !disabledUsers.has(user);
+      const meta = centers.length
+        ? `负责 ${centers.length} 个云中心 · 停用后按云中心转给各自备岗`
+        : '未限定云中心';
       return `
         <label class="cfg-row ${enabled ? '' : 'off'}" data-user="${escapeHtml(user)}">
           <input type="checkbox" ${enabled ? 'checked' : ''}>
           <span class="u">${escapeHtml(user)}</span>
-          <span class="meta">${escapeHtml(center || '未限定云中心')} · 备岗：${escapeHtml(backup || '未配置')}</span>
+          <span class="meta">${escapeHtml(meta)}</span>
         </label>`;
     }).join('');
 
@@ -400,14 +451,18 @@
         row.classList.toggle('off', !cb.checked);
         updateFab();
 
-        const center = (users.find((u) => u.user === user) || {}).center || '';
-        const backup = findBackup(center);
+        const entry = users.find((u) => u.user === user) || { centers: [] };
         if (cb.checked) {
           toast(`${user} 已启用`);
-        } else if (backup) {
-          toast(`${user} 已停用，其工单将转给备岗 ${backup}`);
+        } else if (!entry.centers.length) {
+          toast(`${user} 已停用`, false);
         } else {
-          toast(`${user} 已停用，但云中心「${center || '未知'}」没有配置备岗`, true);
+          const noBackup = entry.centers.filter((c) => !findBackup(c));
+          if (noBackup.length) {
+            toast(`${user} 已停用；${noBackup.length} 个云中心没有备岗，相关工单会在执行前被拦下`, true);
+          } else {
+            toast(`${user} 已停用，其 ${entry.centers.length} 个云中心的工单将转给各自备岗`);
+          }
         }
       });
     });
