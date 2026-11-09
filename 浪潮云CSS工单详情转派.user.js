@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单详情转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.1.0
+// @version      1.2.0
 // @description  工单详情页一键转派：自动点「转派」、选处理人员、填「请老师处理」并保存
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
@@ -23,17 +23,21 @@
     { account: 'xieruijie', name: '解瑞杰' },
     { account: 'yujingming', name: '庾景铭' },
     { account: 'liuqingkai01', name: '刘庆凯' },
+    { account: 'zhengpengke', name: '郑鹏科' },
   ];
 
   const DEFAULT_DESC = '请老师处理';
   const KEY_USER = 'css-detail-transfer-user';
   const KEY_DESC = 'css-detail-transfer-desc';
   const KEY_DRY = 'css-detail-transfer-dry';
+  const KEY_CLAIM = 'css-detail-transfer-claim';
 
   const state = {
     running: false,
     steps: [],
     dry: localStorage.getItem(KEY_DRY) === '1',
+    // 转派前必须先回答「是否认领工单」，这里记住用户的默认选择
+    claim: localStorage.getItem(KEY_CLAIM) !== '0',
     user: localStorage.getItem(KEY_USER) || PEOPLE[0].account,
     desc: localStorage.getItem(KEY_DESC) || DEFAULT_DESC,
   };
@@ -161,20 +165,26 @@
       log(`点击「${btn.innerText.trim()}」`);
       click(btn);
     };
+
+    // 真实页面：不先回答「是否认领工单」就直接点「转派」，只会弹一句提示，表单根本不出现
+    const chooseClaim = () => {
+      const want = state.claim ? '认领' : '不认领';
+      const el = [...document.querySelectorAll('.ant-radio-wrapper')]
+        .filter(isVisible)
+        .find((r) => norm(r.innerText) === want);
+      if (!el || el.querySelector('.ant-radio-checked')) return false;
+      log(`先选「${want}」`);
+      click(el);
+      return true;
+    };
+
+    if (chooseClaim()) await sleep(400);
     clickTransfer();
 
-    // 真实页面：没选「认领此单」时会弹「请先选择是否认领工单」，必须先认领才能转派
     await sleep(1200);
-    if (!findTransferForm()) {
-      const radios = [...document.querySelectorAll('.ant-radio-wrapper')].filter(isVisible);
-      const claim = radios.find((el) => norm(el.innerText) === '认领');
-      const claimChecked = claim && !!claim.querySelector('.ant-radio-checked');
-      if (claim && !claimChecked && (/认领/.test(toastText()) || radios.length === 2)) {
-        log('先选「认领」');
-        click(claim);
-        await sleep(500);
-        clickTransfer();
-      }
+    if (!findTransferForm() && /认领/.test(toastText()) && chooseClaim()) {
+      await sleep(400);
+      clickTransfer();
     }
 
     const form = await waitFor(() => {
@@ -401,7 +411,7 @@
 
     render();
     try {
-      log(`开始：转给 ${person.name}（${person.account}）${state.dry ? '｜试跑模式' : ''}`);
+      log(`开始：转给 ${person.name}（${person.account}）${state.claim ? '｜认领' : '｜不认领'}${state.dry ? '｜试跑模式' : ''}`);
       const form = await openTransferForm();
       await pickUser(form, person);
       await fillDescription(form, state.desc);
@@ -451,14 +461,22 @@
     shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `
       <style>
-        :host { all: initial; }
+        :host {
+          all: initial;
+          /* 主题：蓝紫 */
+          --brand: #5b4bdb;
+          --brand-deep: #4a3ac4;
+          --brand-soft: #7a6cf0;
+          --brand-weak: #efedfd;
+          --brand-off: #b6adf0;
+        }
         * { box-sizing: border-box; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
         #fab {
           width: 46px; height: 46px; border: 0; border-radius: 23px; cursor: pointer;
-          background: #fff; color: #1677ff; font-size: 13px; font-weight: 600;
-          box-shadow: 0 4px 14px rgba(0, 0, 0, .18);
+          background: #fff; color: var(--brand); font-size: 13px; font-weight: 600;
+          box-shadow: 0 4px 14px rgba(84, 64, 200, .28);
         }
-        #fab:hover { background: #f0f7ff; }
+        #fab:hover { background: var(--brand-weak); }
         #panel {
           display: none; width: 244px; background: #fff; border-radius: 8px;
           box-shadow: 0 8px 30px rgba(0, 0, 0, .2); overflow: hidden;
@@ -471,23 +489,31 @@
         #panel .head b { font-weight: 600; }
         #close { border: 0; background: transparent; color: #999; cursor: pointer; font-size: 15px; line-height: 1; }
         #people { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 10px 4px; }
+        #claimRow { display: flex; align-items: center; gap: 6px; padding: 4px 10px 0; }
+        #claimRow .lab { font-size: 12px; color: #8a8a8a; white-space: nowrap; }
+        #claimRow .c {
+          flex: 1; padding: 4px 0; border: 1px solid #d9d9d9; border-radius: 4px;
+          background: #fff; color: #555; font-size: 12px; cursor: pointer;
+        }
+        #claimRow .c:hover { border-color: var(--brand); color: var(--brand); }
+        #claimRow .c.on { border-color: var(--brand); background: var(--brand-weak); color: var(--brand); font-weight: 600; }
         .p {
           flex: 1 0 72px; padding: 7px 4px; border: 1px solid #d9d9d9; border-radius: 5px;
           background: #fff; color: #333; font-size: 13px; cursor: pointer; text-align: center;
         }
-        .p:hover { border-color: #1677ff; color: #1677ff; }
-        .p.on { border-color: #1677ff; background: #e6f0ff; color: #1677ff; font-weight: 600; }
+        .p:hover { border-color: var(--brand); color: var(--brand); }
+        .p.on { border-color: var(--brand); background: var(--brand-weak); color: var(--brand); font-weight: 600; }
         #desc {
           width: calc(100% - 20px); margin: 8px 10px 0; padding: 6px 8px; font-size: 13px;
           border: 1px solid #d9d9d9; border-radius: 4px; outline: none;
         }
-        #desc:focus { border-color: #1677ff; }
+        #desc:focus { border-color: var(--brand); }
         #run {
           width: calc(100% - 20px); margin: 8px 10px 6px; padding: 9px 0; border: 0; border-radius: 5px;
-          background: #1677ff; color: #fff; font-size: 14px; cursor: pointer;
+          background: var(--brand); color: #fff; font-size: 14px; cursor: pointer;
         }
-        #run:hover { background: #4096ff; }
-        #run[disabled] { background: #8fbcf7; cursor: not-allowed; }
+        #run:hover { background: var(--brand-soft); }
+        #run[disabled] { background: var(--brand-off); cursor: not-allowed; }
         #foot {
           display: flex; align-items: center; justify-content: space-between;
           padding: 0 10px 10px; font-size: 12px; color: #888;
@@ -518,6 +544,11 @@
       <div id="panel">
         <div class="head"><b>转给谁？</b><button id="close" title="收起">×</button></div>
         <div id="people"></div>
+        <div id="claimRow">
+          <span class="lab">是否认领</span>
+          <button class="c" data-claim="1">认领</button>
+          <button class="c" data-claim="0">不认领</button>
+        </div>
         <input id="desc" placeholder="处理描述">
         <button id="run">一键转派</button>
         <div id="foot">
@@ -593,6 +624,16 @@
     const desc = shadow.getElementById('desc');
     if (desc.value !== state.desc) desc.value = state.desc;
     shadow.getElementById('dry').checked = state.dry;
+
+    shadow.querySelectorAll('#claimRow .c').forEach((btn) => {
+      const wanted = btn.dataset.claim === '1';
+      btn.classList.toggle('on', wanted === state.claim);
+      btn.onclick = () => {
+        state.claim = wanted;
+        localStorage.setItem(KEY_CLAIM, wanted ? '1' : '0');
+        render();
+      };
+    });
 
     const run = shadow.getElementById('run');
     run.disabled = state.running;
