@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单详情转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.2.0
-// @description  工单详情页一键转派：自动点「转派」、选处理人员、填「请老师处理」并保存
+// @version      1.3.0
+// @description  工单详情页/查询列表页一键转派：自动点「转派」、选处理人员、填「请老师处理」并保存
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
 // @run-at       document-idle
@@ -29,13 +29,11 @@
   const DEFAULT_DESC = '请老师处理';
   const KEY_USER = 'css-detail-transfer-user';
   const KEY_DESC = 'css-detail-transfer-desc';
-  const KEY_DRY = 'css-detail-transfer-dry';
   const KEY_CLAIM = 'css-detail-transfer-claim';
 
   const state = {
     running: false,
     steps: [],
-    dry: localStorage.getItem(KEY_DRY) === '1',
     // 转派前必须先回答「是否认领工单」，这里记住用户的默认选择
     claim: localStorage.getItem(KEY_CLAIM) !== '0',
     user: localStorage.getItem(KEY_USER) || PEOPLE[0].account,
@@ -116,6 +114,9 @@
     const wanted = texts.map(norm);
     return allButtons(root).filter((b) => wanted.includes(btnText(b)));
   }
+
+  /** 当前是不是「工单查询」列表页（批量转派）；否则按详情页处理 */
+  const isListPage = () => /\/workorder\/search/.test(location.href);
 
   /** 详情页顶部的「转派」按钮（排除列表页的「批量转派」） */
   function findTransferButton() {
@@ -403,36 +404,81 @@
     return `${form.tagName.toLowerCase()} | ${html}`;
   }
 
+  /** 列表页勾选的工单行 */
+  function selectedRows() {
+    return [...document.querySelectorAll('.ant-table-tbody tr')]
+      .filter((tr) => tr.querySelector('.ant-checkbox-checked'));
+  }
+
+  /** 列表页工具栏的「批量转派」（勾选工单后才出现） */
+  function findBatchButton() {
+    return allButtons().find((b) => btnText(b) === '批量转派')
+      || allButtons().find((b) => /批量转派/.test(btnText(b)))
+      || null;
+  }
+
+  /** 列表页批量转派：点「批量转派」→ 确认 → 等批量表单（右侧抽屉） */
+  async function openBatchForm() {
+    const btn = findBatchButton();
+    if (!btn) throw new Error('没有找到「批量转派」按钮：请先在列表里勾选工单');
+
+    log(`点击「${btn.innerText.trim()}」`);
+    click(btn);
+
+    // 先弹「是否确认批量转派？」
+    await sleep(600);
+    const ok = await waitFor(() => {
+      const modals = visibleContainers().filter((el) => !looksLikeTransferForm(el) && /确认批量转派|确认转派/.test(norm(el.innerText)));
+      return modals.length ? buttonsByText(['确认', '确定'], modals[modals.length - 1])[0] : null;
+    }, 4000, 150);
+    if (ok) {
+      log('确认批量转派');
+      click(ok);
+    }
+
+    const form = await waitFor(() => findTransferForm(), 12000, 200);
+    if (!form) throw new Error('点了「批量转派」但表单没有出现');
+    log('批量转派表单已打开');
+    return form;
+  }
+
   async function runTransfer() {
     if (state.running) return;
     state.running = true;
     state.steps = [];
     const person = PEOPLE.find((p) => p.account === state.user) || PEOPLE[0];
+    const batch = isListPage();
 
     render();
     try {
-      log(`开始：转给 ${person.name}（${person.account}）${state.claim ? '｜认领' : '｜不认领'}${state.dry ? '｜试跑模式' : ''}`);
-      const form = await openTransferForm();
+      let form;
+      if (batch) {
+        const rows = selectedRows();
+        if (!rows.length) throw new Error('请先在列表里勾选要转派的工单');
+        log(`批量转派：已勾选 ${rows.length} 张，转给 ${person.name}（${person.account}）`);
+        form = await openBatchForm();
+      } else {
+        log(`开始：转给 ${person.name}（${person.account}）${state.claim ? '｜认领' : '｜不认领'}`);
+        form = await openTransferForm();
+      }
+
       await pickUser(form, person);
       await fillDescription(form, state.desc);
 
       const save = findSaveButton(form);
       if (!save) throw new Error('没有找到「保存」按钮');
-
-      if (state.dry) {
-        log('试跑模式：表单已填好，未点保存');
-        toast(`试跑完成：已填好 ${person.name}，请手动检查后保存`);
-        return;
+      if (save.disabled) {
+        throw new Error(batch
+          ? '「保存」按钮不可用：处理技能组或处理人员可能没选上，点「诊断」看看表单'
+          : '「保存」按钮不可用，表单校验没通过');
       }
-
-      if (save.disabled) throw new Error('「保存」按钮不可用，表单校验没通过');
       log('点击「保存」');
       click(save);
 
       const result = await waitResult(form);
       if (!result.ok) throw new Error(result.msg || '转派失败');
       log(`转派成功：${result.msg || '表单已关闭'}`);
-      toast(`已转派给 ${person.name}`);
+      toast(batch ? `已批量转派给 ${person.name}` : `已转派给 ${person.name}`);
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       log(`失败：${msg}`);
@@ -552,7 +598,7 @@
         <input id="desc" placeholder="处理描述">
         <button id="run">一键转派</button>
         <div id="foot">
-          <label><input type="checkbox" id="dry"> 试跑（只填不保存）</label>
+          <span id="mode">详情页</span>
           <button id="diag">诊断</button>
         </div>
         <div id="diagBox">
@@ -584,11 +630,6 @@
     shadow.getElementById('desc').addEventListener('input', (e) => {
       state.desc = e.target.value;
       localStorage.setItem(KEY_DESC, state.desc);
-    });
-
-    shadow.getElementById('dry').addEventListener('change', (e) => {
-      state.dry = e.target.checked;
-      localStorage.setItem(KEY_DRY, state.dry ? '1' : '0');
     });
 
     shadow.getElementById('run').addEventListener('click', runTransfer);
@@ -623,7 +664,11 @@
 
     const desc = shadow.getElementById('desc');
     if (desc.value !== state.desc) desc.value = state.desc;
-    shadow.getElementById('dry').checked = state.dry;
+
+    const batch = isListPage();
+
+    const claimRow = shadow.getElementById('claimRow');
+    if (claimRow) claimRow.style.display = batch ? 'none' : 'flex';
 
     shadow.querySelectorAll('#claimRow .c').forEach((btn) => {
       const wanted = btn.dataset.claim === '1';
@@ -637,7 +682,24 @@
 
     const run = shadow.getElementById('run');
     run.disabled = state.running;
-    run.textContent = state.running ? '执行中…' : `一键转派给 ${nameOf(state.user)}`;
+    run.textContent = state.running
+      ? '执行中…'
+      : `${batch ? '批量转派给' : '一键转派给'} ${nameOf(state.user)}`;
+
+    refreshMode();
+  }
+
+  /** 底部那行小字：详情页 / 列表页已选几张 */
+  function refreshMode() {
+    if (!shadow) return;
+    const mode = shadow.getElementById('mode');
+    if (!mode) return;
+    if (!isListPage()) {
+      mode.textContent = '详情页';
+      return;
+    }
+    const n = selectedRows().length;
+    mode.textContent = n ? `列表页 · 已勾选 ${n} 张` : '列表页 · 请先勾选工单';
   }
 
   function toast(msg, isError = false) {
@@ -673,6 +735,8 @@
   function init() {
     ensureUI();
     render();
+    // 列表页勾选数量会变，面板收起时也要跟上；只刷一行小字，不重建人员按钮
+    setInterval(refreshMode, 1200);
   }
 
   if (document.readyState === 'loading') {
