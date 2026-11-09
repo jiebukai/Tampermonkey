@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单详情转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.0.0
+// @version      1.1.0
 // @description  工单详情页一键转派：自动点「转派」、选处理人员、填「请老师处理」并保存
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
@@ -144,12 +144,38 @@
     return list.length ? list[list.length - 1] : null;
   }
 
+  /** 页面上的 .ant-message 提示文字（转派前系统会用这个拦人） */
+  function toastText() {
+    return visibleContainers()
+      .concat([...document.querySelectorAll('.ant-message-notice, .ant-message')].filter(isVisible))
+      .map((el) => norm(el.innerText))
+      .join(' ');
+  }
+
   /** 点了「转派」之后可能先弹确认框，再出表单；两者都等 */
   async function openTransferForm() {
     const btn = findTransferButton();
     if (!btn) throw new Error('没找到「转派」按钮（请确认当前是工单详情页，且工单状态允许转派）');
-    log(`点击「${btn.innerText.trim()}」`);
-    click(btn);
+
+    const clickTransfer = () => {
+      log(`点击「${btn.innerText.trim()}」`);
+      click(btn);
+    };
+    clickTransfer();
+
+    // 真实页面：没选「认领此单」时会弹「请先选择是否认领工单」，必须先认领才能转派
+    await sleep(1200);
+    if (!findTransferForm()) {
+      const radios = [...document.querySelectorAll('.ant-radio-wrapper')].filter(isVisible);
+      const claim = radios.find((el) => norm(el.innerText) === '认领');
+      const claimChecked = claim && !!claim.querySelector('.ant-radio-checked');
+      if (claim && !claimChecked && (/认领/.test(toastText()) || radios.length === 2)) {
+        log('先选「认领」');
+        click(claim);
+        await sleep(500);
+        clickTransfer();
+      }
+    }
 
     const form = await waitFor(() => {
       const found = findTransferForm();
@@ -212,6 +238,23 @@
     return { dd, items };
   }
 
+  /** 在下拉框里按账号搜索；服务端搜索必须等组件进入搜索态后写值才生效 */
+  async function searchUser(select, account) {
+    const input = await waitFor(() => {
+      const el = select.querySelector('input.ant-select-search__field')
+        || select.querySelector('input:not([type="hidden"])');
+      return el && isVisible(el) ? el : null;
+    }, 2000, 100);
+    if (!input) return false;
+
+    input.focus();
+    // 先清空再写入，值没变化时组件不会重新发请求
+    setNativeValue(input, '');
+    await sleep(120);
+    setNativeValue(input, account);
+    return true;
+  }
+
   async function pickUser(form, person) {
     const select = findUserSelect(form);
     if (!select) throw new Error('表单里没有找到「处理人员」下拉框');
@@ -229,42 +272,54 @@
       await sleep(200);
     }
 
-    click(selectionTarget(select));
-    await sleep(300);
-
-    // 能搜索的下拉框：输入账号缩小范围；不能搜索的也支持直接点
-    const input = await waitFor(() => {
-      const el = select.querySelector('input.ant-select-search__field')
-        || select.querySelector('input:not([type="hidden"])');
-      return el && isVisible(el) ? el : null;
-    }, 2000, 100);
-
-    if (input) {
-      input.focus();
-      setNativeValue(input, person.account);
+    // 第一次点击有时只是关掉上一个残留浮层，所以确认真的展开了才算
+    let opened = null;
+    for (let i = 0; i < 3 && !opened; i += 1) {
+      click(selectionTarget(select));
+      opened = await waitFor(() => dropdownOptions().dd, 1200, 100);
+      if (!opened) await sleep(200);
     }
+    if (!opened) throw new Error('「处理人员」下拉框没有展开');
 
-    const option = await waitFor(() => {
-      const { items } = dropdownOptions();
-      if (!items.length) return null;
+    // 服务端搜索有延迟，结果没收敛就重输一次
+    let option = null;
+    for (let attempt = 0; attempt < 3 && !option; attempt += 1) {
+      if (attempt > 0) log(`重新搜索人员（第 ${attempt + 1} 次）`);
+      await searchUser(select, person.account);
 
-      const byAccount = items.filter((li) => btnText(li).includes(`[${person.account}]`));
-      if (byAccount.length === 1) return byAccount[0];
+      option = await waitFor(() => {
+        const { items } = dropdownOptions();
+        if (!items.length) return null;
 
-      const byName = items.filter((li) => btnText(li).includes(person.name));
-      if (byName.length === 1 && items.length <= 8) return byName[0];
+        const byAccount = items.filter((li) => btnText(li).includes(`[${person.account}]`));
+        if (byAccount.length === 1) return byAccount[0];
 
-      return null;
-    }, 8000, 200);
+        const byName = items.filter((li) => btnText(li).includes(person.name));
+        if (byName.length === 1 && items.length <= 8) return byName[0];
+
+        return null;
+      }, 3000, 150);
+    }
 
     if (!option) {
       throw new Error(`人员下拉里没有找到 ${person.name}（${person.account}）`);
     }
 
-    click(option);
-    await sleep(500);
+    // 系统会把自己（当前登录人）的选项置灰，点了不会生效
+    if (/disabled/.test(option.className) || option.getAttribute('aria-disabled') === 'true') {
+      throw new Error(`系统不允许把工单转给 ${person.name}（该选项是置灰的，通常是因为他/她就是你本人）`);
+    }
 
-    const chosen = selectedText(select);
+    // 点击选项；偶尔第一次点击被浮层重绘吃掉，再补一次
+    let chosen = '';
+    for (let i = 0; i < 2; i += 1) {
+      option.scrollIntoView({ block: 'nearest' });
+      await sleep(120);
+      click(option);
+      await sleep(600);
+      chosen = selectedText(select);
+      if (chosen.includes(person.name) || chosen.includes(person.account)) break;
+    }
     if (!chosen.includes(person.name) && !chosen.includes(person.account)) {
       throw new Error(`人员 ${person.name} 没有被选中（当前显示：${chosen}）`);
     }
@@ -272,14 +327,18 @@
   }
 
   async function fillDescription(form, text) {
-    const editor = form.querySelector('.ql-editor')
+    // 注意：真实页面里 <quill-editor> 宿主元素本身就有 class="ql-editor"，
+    // 真正可编辑的是里面的 .ql-container .ql-editor，直接改宿主会把工具栏冲掉。
+    const editor = form.querySelector('.ql-container .ql-editor')
+      || form.querySelector('.ql-editor[contenteditable="true"]')
       || form.querySelector('[contenteditable="true"]');
     if (editor) {
       editor.innerHTML = String(text)
         .split('\n')
         .map((line) => `<p>${escapeHtml(line)}</p>`)
         .join('');
-      // Quill 通过 MutationObserver 异步同步到表单模型
+      // Quill 通过 MutationObserver 异步同步到表单模型，再补一次 input 兜底
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
       await sleep(500);
       log('处理描述已填写（富文本）');
       return;
@@ -447,10 +506,10 @@
           border: 1px solid #d9d9d9; border-radius: 4px; background: #fff;
         }
         #toast {
-          position: fixed; right: 0; bottom: 210px; max-width: 244px;
+          position: fixed; right: 24px; top: 96px; max-width: 260px;
           background: rgba(0, 0, 0, .82); color: #fff; font-size: 13px; line-height: 1.5;
-          padding: 8px 12px; border-radius: 6px; opacity: 0; transform: translateY(8px);
-          transition: all .18s; pointer-events: none;
+          padding: 8px 12px; border-radius: 6px; opacity: 0; transform: translateY(-8px);
+          transition: all .18s; pointer-events: none; z-index: 2;
         }
         #toast.show { opacity: 1; transform: translateY(0); }
         #toast.err { background: #d4380d; }
