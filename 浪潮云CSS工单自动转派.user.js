@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单自动转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.4.0
-// @description  勾选工单后，按规则表自动匹配处理人员，一键完成批量转派
+// @version      1.5.0
+// @description  勾选工单后，按规则表自动匹配处理人员（主岗 → 备岗 → 顺延负责人），一键完成批量转派
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
 // @run-at       document-idle
@@ -86,15 +86,23 @@
   ];
 
   /**
+   * 顺延顺序（列名 → 优先级）：先「权限回收负责人」这一对，再「一般变更二线」这一对。
+   * 表格里的列一旦认成某个 key，就会按这个顺序拼成顺延链。
+   */
+  const CHAIN_COLUMNS = ['recallPrimary', 'recallBackup', 'primary', 'backup'];
+
+  /**
    * 运行时表：默认等于内置表，导入外部表格后整体替换。
    * 始终复用同一个数组（splice 改写），这样重建后所有引用依然有效。
-   * backups 保留多个备岗（外部表格里「李新勇、于雷」这种写法），backup 是默认备岗。
+   *
+   * chain 是一个云中心的「顺延链」，按优先级排好、已去重：
+   *   权限回收负责人（主岗）→ 权限回收负责人（备岗）→ 一般变更二线主岗 → 一般变更二线备岗
+   * 老格式（云中心/主岗/备岗）导入后就是 [主岗, 备岗…]。
+   * primary/backup/backups 是 chain 的派生值，保留给配置页和旧逻辑用。
    */
-  const CENTERS = BUILTIN_CENTERS.map((c) => ({
-    center: c.center,
-    primary: c.primary,
-    backup: c.backup,
-    backups: [c.backup].filter(Boolean),
+  const CENTERS = BUILTIN_CENTERS.map((c) => makeCenterRow(c.center, {
+    primary: [c.primary],
+    backup: [c.backup],
   }));
 
   /** 账号 → 姓名（配置页显示用） */
@@ -211,24 +219,41 @@
 
   const COLUMN_ALIASES = {
     center: ['云中心', '云中心名称', '中心', '云中心名'],
-    primary: ['主岗', '二线主岗', '主负责人', '负责人', '主岗账号'],
-    backup: ['备岗', '二线备岗', '备岗负责人', '备份', '备'],
+    recallPrimary: ['权限回收负责人主岗', '权限回收主岗', '回收负责人主岗'],
+    recallBackup: ['权限回收负责人备岗', '权限回收备岗', '回收负责人备岗'],
+    primary: ['主岗', '二线主岗', '一般变更二线主岗', '一般变更主岗', '主负责人', '负责人', '主岗账号'],
+    backup: ['备岗', '二线备岗', '一般变更二线备岗', '一般变更备岗', '备岗负责人', '备份', '备'],
   };
 
-  /** 表头判定用：单元格必须「整个等于」某个别名，避免把「甲云中心」这类数据行当成表头 */
-  const HEADER_WORDS = [
-    ...COLUMN_ALIASES.center,
-    ...COLUMN_ALIASES.primary,
-    ...COLUMN_ALIASES.backup,
-  ];
+  /** 报错时用的列名 */
+  const COLUMN_LABELS = {
+    recallPrimary: '权限回收负责人（主岗）',
+    recallBackup: '权限回收负责人（备岗）',
+    primary: '主岗',
+    backup: '备岗',
+  };
 
-  /** 表头 → 列号：先全等，再包含 */
-  function findColumn(headers, key) {
-    const aliases = COLUMN_ALIASES[key];
-    const norm = headers.map((h) => String(h || '').replace(/[\u3000\s]/g, ''));
-    let idx = norm.findIndex((h) => h && aliases.includes(h));
+  /** 表头归一化：去掉空白和各种括号，让「权限回收负责人（主岗）」和「权限回收负责人(主岗)」等价 */
+  function normHeader(v) {
+    return String(v == null ? '' : v).replace(/[\s\u3000（）()\[\]【】:：]/g, '');
+  }
+
+  /** 表头判定用：单元格必须「整个等于」某个别名，避免把「甲云中心」这类数据行当成表头 */
+  const HEADER_WORDS = Object.values(COLUMN_ALIASES).flat();
+
+  /**
+   * 表头 → 列号：先全等，再包含。
+   * taken：已被更高优先级的列占用的下标，不再参与匹配；
+   * avoid：出现这些字样的表头不能算作该列（例如「权限回收负责人主岗」不能被当成主岗）。
+   */
+  function findColumn(headers, key, taken = [], avoid = []) {
+    const aliases = COLUMN_ALIASES[key] || [];
+    const skip = new Set(taken);
+    const norm = headers.map(normHeader);
+    const usable = (i) => norm[i] && !skip.has(i) && !avoid.some((w) => norm[i].includes(w));
+    let idx = norm.findIndex((h, i) => usable(i) && aliases.includes(norm[i]));
     if (idx >= 0) return idx;
-    idx = norm.findIndex((h) => h && aliases.some((a) => h.includes(a)));
+    idx = norm.findIndex((h, i) => usable(i) && aliases.some((a) => norm[i].includes(a)));
     return idx;
   }
 
@@ -248,22 +273,36 @@
 
     const delim = detectDelimiter(lines);
     let cellsAll = lines.map((l) => splitDelimited(l, delim));
+    // 没有表头时的列顺序：云中心 / 主岗 / 备岗（老格式）
     let colCenter = 0;
     let colPrimary = 1;
     let colBackup = 2;
+    let colRecallP = -1;
+    let colRecallB = -1;
 
-    const headCells = cellsAll[0].map((c) => String(c || '').replace(/[\u3000\s]/g, ''));
+    const headCells = cellsAll[0].map(normHeader);
     if (headCells.some((c) => HEADER_WORDS.includes(c))) {
       result.hasHeader = true;
-      colCenter = findColumn(cellsAll[0], 'center');
-      colPrimary = findColumn(cellsAll[0], 'primary');
-      colBackup = findColumn(cellsAll[0], 'backup');
+      const head = cellsAll[0];
+      const taken = [];
+      colCenter = findColumn(head, 'center', taken);
+      if (colCenter >= 0) taken.push(colCenter);
+      colRecallP = findColumn(head, 'recallPrimary', taken, ['一般变更']);
+      if (colRecallP >= 0) taken.push(colRecallP);
+      colRecallB = findColumn(head, 'recallBackup', taken, ['一般变更']);
+      if (colRecallB >= 0) taken.push(colRecallB);
+      colPrimary = findColumn(head, 'primary', taken, ['权限回收']);
+      if (colPrimary >= 0) taken.push(colPrimary);
+      colBackup = findColumn(head, 'backup', taken, ['权限回收']);
+
       if (colCenter < 0) {
         result.errors.push('表头里找不到「云中心」列');
         return result;
       }
-      if (colPrimary < 0) result.warnings.push('表头里没有「主岗」列，所有行都会缺主岗');
-      if (colBackup < 0) result.warnings.push('表头里没有「备岗」列，所有行都会缺备岗');
+      if (colRecallP < 0 && colPrimary < 0) {
+        result.warnings.push('表头里没有「主岗」或「权限回收负责人（主岗）」列，所有行都会缺负责人');
+      }
+      if (colRecallP >= 0) result.warnings.push('检测到「权限回收负责人」列：这类云中心会先转回收负责人，停用后顺延到一般变更二线主岗/备岗');
       cellsAll = cellsAll.slice(1);
     } else {
       result.warnings.push('未检测到表头，按「云中心 / 主岗 / 备岗」顺序解析前三列');
@@ -278,19 +317,27 @@
         return;
       }
 
-      const p = colPrimary >= 0 && colPrimary < cells.length ? cellToAccount(cells[colPrimary]) : { value: '' };
-      const b = colBackup >= 0 && colBackup < cells.length ? cellToAccounts(cells[colBackup]) : { values: [], errors: [] };
-
-      if (p.error) {
-        result.errors.push(`第 ${lineNo} 行主岗「${p.error}」既不是已知姓名也不是账号格式`);
+      const cols = {};
+      const bad = [];
+      for (const key of CHAIN_COLUMNS) {
+        const col = { recallPrimary: colRecallP, recallBackup: colRecallB, primary: colPrimary, backup: colBackup }[key];
+        const parsed = col >= 0 && col < cells.length
+          ? cellToAccounts(cells[col])
+          : { values: [], errors: [] };
+        cols[key] = parsed.values;
+        if (parsed.errors.length) {
+          bad.push(`「${COLUMN_LABELS[key]}」列的「${parsed.errors.join('、')}」既不是已知姓名也不是账号格式`);
+        }
       }
-      if (b.errors.length) {
-        result.errors.push(`第 ${lineNo} 行备岗「${b.errors.join('、')}」既不是已知姓名也不是账号格式`);
+      if (bad.length) {
+        result.errors.push(`第 ${lineNo} 行${bad.join('；')}`);
+        return;
       }
-      if (p.error || b.errors.length) return;
-      if (!p.value) result.warnings.push(`第 ${lineNo} 行「${center}」没有主岗，该云中心不会命中规则`);
 
-      const row = { center, primary: p.value, backup: b.values[0] || '', backups: b.values.slice() };
+      const row = makeCenterRow(center, cols);
+      if (!row.chain.length) {
+        result.warnings.push(`第 ${lineNo} 行「${center}」一个负责人都没有，该云中心不会命中规则`);
+      }
       if (seen.has(center)) {
         result.warnings.push(`云中心「${center}」重复出现（第 ${lineNo} 行），以最后一次为准`);
         Object.assign(seen.get(center), row);
@@ -304,35 +351,99 @@
     return result;
   }
 
-  /** 结构校验：丢弃残缺行、去重、统一成 {center, primary, backup, backups} */
+  /** 去重（保持先后顺序） */
+  function dedupeAccounts(list) {
+    const out = [];
+    for (const raw of Array.isArray(list) ? list : []) {
+      const acc = String(raw == null ? '' : raw).trim();
+      if (acc && !out.includes(acc)) out.push(acc);
+    }
+    return out;
+  }
+
+  /** 把一行的几列负责人拼成顺延链：{center, chain, cols, primary, backup, backups} */
+  function makeCenterRow(center, cols) {
+    const clean = {};
+    for (const key of CHAIN_COLUMNS) clean[key] = dedupeAccounts(cols && cols[key]);
+    const chain = [];
+    for (const key of CHAIN_COLUMNS) {
+      for (const acc of clean[key]) if (!chain.includes(acc)) chain.push(acc);
+    }
+    return {
+      center: String(center == null ? '' : center).trim(),
+      chain,
+      cols: clean,
+      primary: chain[0] || '',
+      backup: chain[1] || '',
+      backups: chain.slice(1),
+    };
+  }
+
+  /**
+   * 沿顺延链找第一个人：跳过已停用的，返回 { user, step }，全都停用则 user 为 null。
+   * 纯函数，方便单测。
+   */
+  function walkChain(chain, isDisabled) {
+    const list = Array.isArray(chain) ? chain : [];
+    for (let i = 0; i < list.length; i += 1) {
+      if (!isDisabled(list[i])) return { user: list[i], step: i };
+    }
+    return { user: null, step: -1 };
+  }
+
+  /** 结构校验：丢弃残缺行、去重、统一成 {center, chain, cols, primary, backup, backups} */
   function normalizeCenterRows(list) {
     const out = [];
     const seen = new Set();
     for (const item of Array.isArray(list) ? list : []) {
       if (!item || typeof item !== 'object') continue;
       const center = String(item.center == null ? '' : item.center).trim();
-      const primary = String(item.primary == null ? '' : item.primary).trim();
-      if (!center || !primary || seen.has(center)) continue;
+      if (!center || seen.has(center)) continue;
+
+      // 新格式带 cols；老格式只有 primary/backup/backups
+      const cols = item.cols && typeof item.cols === 'object'
+        ? item.cols
+        : {
+          primary: [item.primary].filter(Boolean),
+          backup: (Array.isArray(item.backups) ? item.backups : [item.backup]).filter(Boolean),
+        };
+      const row = makeCenterRow(center, cols);
+      // 既没有 cols 也没有老字段时，退回 chain
+      if (!row.chain.length && Array.isArray(item.chain)) {
+        row.chain = dedupeAccounts(item.chain);
+        row.primary = row.chain[0] || '';
+        row.backup = row.chain[1] || '';
+        row.backups = row.chain.slice(1);
+        row.cols = { primary: row.chain.slice(), backup: [], recallPrimary: [], recallBackup: [] };
+      }
+      if (!row.chain.length) continue;
       seen.add(center);
-      const backups = (Array.isArray(item.backups) ? item.backups : [item.backup])
-        .map((x) => String(x == null ? '' : x).trim())
-        .filter(Boolean);
-      out.push({ center, primary, backup: backups[0] || '', backups });
+      out.push(row);
     }
     return out;
   }
 
-  /** 导出成 CSV（姓名优先，认不出的账号原样输出），带 BOM 方便 Excel 直接打开 */
+  /**
+   * 导出成 CSV（姓名优先，认不出的账号原样输出），带 BOM 方便 Excel 直接打开。
+   * 列格式跟日常维护的表格一致：云中心 / 权限回收负责人（主岗）/（备岗）/ 一般变更二线主岗 / 备岗。
+   */
   function centersToCsv(rows) {
     const label = (acc) => (PEOPLE[acc] ? PEOPLE[acc] : acc);
     const esc = (v) => {
       const s = String(v == null ? '' : v);
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const lines = ['云中心,主岗,备岗'];
+    const cell = (list) => (Array.isArray(list) ? list : []).filter(Boolean).map(label).join('、');
+    const lines = ['云中心,权限回收负责人（主岗）,权限回收负责人（备岗）,一般变更二线主岗,一般变更二线备岗'];
     for (const r of rows) {
-      const backups = (r.backups && r.backups.length ? r.backups : [r.backup]).filter(Boolean);
-      lines.push([esc(r.center), esc(label(r.primary)), esc(backups.map(label).join('、'))].join(','));
+      const cols = r.cols || {};
+      lines.push([
+        esc(r.center),
+        esc(cell(cols.recallPrimary)),
+        esc(cell(cols.recallBackup)),
+        esc(cell(cols.primary)),
+        esc(cell(cols.backup)),
+      ].join(','));
     }
     return `\uFEFF${lines.join('\r\n')}`;
   }
@@ -569,19 +680,42 @@
    * 决定一张工单该转给谁。
    * 主岗启用 -> 主岗；主岗停用 -> 该云中心的备岗；都没有 -> null
    */
+  /** 某个云中心的顺延链（找不到就退回「主岗 + 备岗」的老规则） */
+  function centerChain(center) {
+    const name = (center || '').trim();
+    if (!name) return [];
+    const hit = CENTERS.find((c) => c.center === name);
+    if (hit && hit.chain && hit.chain.length) return hit.chain;
+    const rule = CONFIG.rules.find((r) => r && r.match && r.match['云中心'] === name);
+    return dedupeAccounts([rule ? rule.user : '', findBackup(name)]);
+  }
+
+  /**
+   * 决定一张工单该转给谁。
+   * 先看手动指派 overrides；否则沿顺延链（主岗 → 备岗 → 表格后面的列）
+   * 找第一个「没被停用」的人；全都被停用就返回 null，交给调用方让用户手动选。
+   */
   function resolveTarget(row) {
     const center = (row['云中心'] || '').trim();
     const manual = center && overrides[center];
-    if (manual) return { user: manual, manual: true };
+    if (manual) return { user: manual, manual: true, center };
 
-    const primary = matchUser(row);
-    if (!primary) return { user: null, reason: 'no-rule' };
+    const chain = centerChain(center);
+    const ruleUser = matchUser(row);
+    const list = chain.length ? chain : dedupeAccounts([ruleUser]);
+    if (!list.length) return { user: null, reason: 'no-rule', center };
 
-    if (!disabledUsers.has(primary)) return { user: primary, primary, fallback: false };
+    const hit = walkChain(list, (u) => disabledUsers.has(u));
+    if (!hit.user) return { user: null, reason: 'all-disabled', center, chain: list, primary: list[0] };
 
-    const backup = findBackup(row['云中心'] || '');
-    if (!backup) return { user: null, reason: 'no-backup', primary };
-    return { user: backup, primary, fallback: true };
+    return {
+      user: hit.user,
+      primary: list[0],
+      chain: list,
+      step: hit.step,
+      fallback: hit.step > 0,
+      center,
+    };
   }
 
   /* ============================== UI ============================== */
@@ -644,6 +778,33 @@
         }
         #dialog .actions button.primary, #cfgDialog .actions button.primary { background: #1677ff; border-color: #1677ff; color: #fff; }
         #dialog .actions button[disabled] { opacity: .5; cursor: not-allowed; }
+        #pickMask {
+          position: fixed; inset: 0; background: rgba(0, 0, 0, .45);
+          display: none; align-items: center; justify-content: center; z-index: 12;
+        }
+        #pickMask.show { display: flex; }
+        #pickDialog {
+          width: 620px; max-height: 76vh; background: #fff; border-radius: 8px;
+          display: flex; flex-direction: column; overflow: hidden;
+          box-shadow: 0 8px 30px rgba(0, 0, 0, .2);
+        }
+        #pickDialog h3 { margin: 0; padding: 16px 20px; font-size: 16px; border-bottom: 1px solid #f0f0f0; }
+        #pickDialog .body { padding: 14px 20px; overflow: auto; font-size: 13px; color: #333; }
+        #pickDialog .body table { width: 100%; border-collapse: collapse; }
+        #pickDialog .body th, #pickDialog .body td {
+          text-align: left; padding: 6px 8px; border-bottom: 1px solid #f5f5f5; vertical-align: middle;
+        }
+        #pickDialog .body th { color: #888; font-weight: 400; white-space: nowrap; }
+        #pickDialog .actions { padding: 12px 20px; border-top: 1px solid #f0f0f0; text-align: right; }
+        #pickDialog .actions button {
+          padding: 6px 16px; margin-left: 8px; border-radius: 4px; font-size: 14px; cursor: pointer;
+          border: 1px solid #d9d9d9; background: #fff; color: #333;
+        }
+        #pickDialog .actions button.primary { background: #1677ff; border-color: #1677ff; color: #fff; }
+        #pickDialog select {
+          width: 100%; max-width: 230px; padding: 4px 6px; font-size: 12px;
+          border: 1px solid #d9d9d9; border-radius: 4px; background: #fff;
+        }
         .cfg-row {
           display: flex; align-items: center; gap: 10px; padding: 10px 4px;
           border-bottom: 1px solid #f5f5f5; cursor: pointer;
@@ -660,6 +821,7 @@
         #cfgDialog .tab.active { color: #1677ff; border-bottom-color: #1677ff; }
         .center-row { display: flex; align-items: center; gap: 8px; padding: 8px 4px; border-bottom: 1px solid #f5f5f5; }
         .center-row .c { flex: 1; font-size: 13px; }
+        .center-row .chain { color: #aaa; font-size: 11px; }
         .center-row select { max-width: 210px; padding: 4px 6px; font-size: 12px; border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; }
         .center-row.manual .c { color: #1677ff; font-weight: 600; }
         #cfgCenterSearch {
@@ -721,7 +883,7 @@
           </div>
           <div class="body">
             <div id="tabPeople">
-              <p class="hint">取消勾选即停用该主岗，其负责的工单会转给对应云中心的备岗。</p>
+              <p class="hint">取消勾选即停用该负责人。工单会按表格顺序顺延：主岗 → 备岗 → 后面的列；一条链上的人全停用了，会自动弹窗让你手动选处理人。</p>
               <div id="cfgList"></div>
             </div>
             <div id="tabCenters" hidden>
@@ -734,15 +896,17 @@
             </div>
             <div id="tabData" hidden>
               <p class="hint">
-                维护云中心负责人：在 Excel 里选中「云中心 / 主岗 / 备岗」三列直接复制粘贴到下面，
-                或选择 CSV/TSV 文件。填姓名或账号都行（姓名自动换成账号）；备岗可写多个，用「、」分隔，取第一个作默认。
+                维护云中心负责人：在 Excel 里整块复制表头 + 数据粘贴到下面，或选择 CSV/TSV 文件。
+                支持 5 列（云中心 / 权限回收负责人（主岗）/（备岗）/ 一般变更二线主岗 / 一般变更二线备岗），
+                也支持老的 3 列（云中心 / 主岗 / 备岗）。填姓名或账号都行（姓名自动换成账号）；
+                同一格写多个人用「、」分隔，靠前的优先；重复的人会自动去重。
               </p>
               <div class="data-bar">
                 <input type="file" id="cfgFile" accept=".csv,.tsv,.txt">
                 <button id="cfgParse">解析预览</button>
                 <button id="cfgClearText">清空</button>
               </div>
-              <textarea id="cfgText" spellcheck="false" placeholder="云中心&#9;主岗&#9;备岗&#10;北京大族云中心&#9;李新勇&#9;黄超"></textarea>
+              <textarea id="cfgText" spellcheck="false" placeholder="云中心&#9;权限回收负责人（主岗）&#9;权限回收负责人（备岗）&#9;一般变更二线主岗&#9;一般变更二线备岗&#10;北京大族云中心&#9;李新勇&#9;黄超&#9;李新勇&#9;李双凤&#10;济南云中心&#9;&#9;&#9;黄超&#9;吕本科、于雷"></textarea>
               <div id="cfgPreview" class="preview"></div>
               <div class="data-bar">
                 <button id="cfgApplyReplace">替换全部</button>
@@ -755,6 +919,23 @@
           </div>
           <div class="actions">
             <button id="cfgClose" class="primary">关闭</button>
+          </div>
+        </div>
+      </div>
+      <div id="pickMask">
+        <div id="pickDialog">
+          <h3>选择处理人员</h3>
+          <div class="body">
+            <p class="hint" id="pickHint"></p>
+            <table>
+              <thead><tr><th>云中心</th><th>工单</th><th>转给</th></tr></thead>
+              <tbody id="pickBody"></tbody>
+            </table>
+            <p class="hint">这次选择只对本次转派生效，不会改动配置。想长期固定，去「配置 → 云中心指派」。</p>
+          </div>
+          <div class="actions">
+            <button id="pickCancel">取消</button>
+            <button id="pickOk" class="primary">开始转派</button>
           </div>
         </div>
       </div>
@@ -794,6 +975,71 @@
   function closeConfirm(value) {
     confirmBox.classList.remove('show');
     if (confirmResolve) { confirmResolve(value); confirmResolve = null; }
+  }
+
+  /**
+   * 手动选人弹窗（一条顺延链上的人全被停用时用）。
+   * groups = [{ center, ids: ['RQ...','RQ...'], chain: [...] }]
+   * 返回 Map(云中心 → 账号)；用户取消返回 null。
+   */
+  function openManualPicker(groups) {
+    ensureUI();
+    const mask = shadow.getElementById('pickMask');
+    const body = shadow.getElementById('pickBody');
+    const total = groups.reduce((n, g) => n + g.ids.length, 0);
+    shadow.getElementById('pickHint').innerHTML =
+      `有 <b>${groups.length}</b> 个云中心（共 <b>${total}</b> 张工单）的负责人全部被停用了，请手动选择处理人员：`;
+
+    const selects = new Map();
+    body.innerHTML = '';
+    for (const g of groups) {
+      const tr = document.createElement('tr');
+      const c1 = document.createElement('td');
+      c1.textContent = g.center;
+      const c2 = document.createElement('td');
+      c2.textContent = g.ids.join('、');
+      const c3 = document.createElement('td');
+      const sel = document.createElement('select');
+      const blank = document.createElement('option');
+      blank.value = '';
+      blank.textContent = '请选择…';
+      sel.appendChild(blank);
+      for (const [acc, name] of Object.entries(PEOPLE)) {
+        const opt = document.createElement('option');
+        opt.value = acc;
+        opt.textContent = `${name}（${acc}）`;
+        sel.appendChild(opt);
+      }
+      c3.appendChild(sel);
+      tr.append(c1, c2, c3);
+      body.appendChild(tr);
+      selects.set(g.center, sel);
+    }
+
+    mask.classList.add('show');
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        mask.classList.remove('show');
+        resolve(val);
+      };
+      shadow.getElementById('pickCancel').onclick = () => finish(null);
+      shadow.getElementById('pickOk').onclick = () => {
+        const map = new Map();
+        let empty = 0;
+        for (const [center, sel] of selects) {
+          if (sel.value) map.set(center, sel.value);
+          else empty += 1;
+        }
+        if (empty) {
+          toast(`还有 ${empty} 个云中心没选处理人`, true);
+          return;
+        }
+        finish(map);
+      };
+    });
   }
 
   function openConfig() {
@@ -935,11 +1181,13 @@
       const options = accounts.map((acc) =>
         `<option value="${escapeHtml(acc)}" ${current === acc ? 'selected' : ''}>${escapeHtml(displayName(acc))}</option>`
       ).join('');
+      const chainText = (c.chain && c.chain.length ? c.chain : [c.primary, c.backup].filter(Boolean))
+        .map((acc) => displayName(acc)).join(' → ');
       return `
         <div class="center-row ${current ? 'manual' : ''}" data-center="${escapeHtml(c.center)}">
-          <span class="c">${highlightMatch(c.center, kw)}</span>
+          <span class="c">${highlightMatch(c.center, kw)}<br><span class="chain">${escapeHtml(chainText || '（未配置负责人）')}</span></span>
           <select>
-            <option value="">跟随规则（${escapeHtml(displayName(c.primary))}）</option>
+            <option value="">跟随规则（${escapeHtml(chainText || '无')}）</option>
             ${options}
           </select>
         </div>`;
@@ -980,8 +1228,8 @@
     const errs = r.errors.slice(0, 8).map((e) => `<li>${escapeHtml(e)}</li>`).join('');
     const warns = r.warnings.slice(0, 6).map((w) => `<li>${escapeHtml(w)}</li>`).join('');
     const rows = r.rows.slice(0, 8).map((x) => {
-      const backups = (x.backups || []).map((a) => displayName(a)).join('、');
-      return `<tr><td>${escapeHtml(x.center)}</td><td>${escapeHtml(displayName(x.primary || ''))}</td><td>${escapeHtml(backups || '—')}</td></tr>`;
+      const chain = (x.chain || []).map((a) => displayName(a)).join(' → ');
+      return `<tr><td>${escapeHtml(x.center)}</td><td>${escapeHtml(chain || '—')}</td></tr>`;
     }).join('');
     const headline = r.errors.length
       ? `<p class="warn">解析到 ${r.rows.length} 个云中心，但有 ${r.errors.length} 处错误，修正后才能应用</p>`
@@ -989,7 +1237,7 @@
     return `${headline}
       ${errs ? `<ul class="warn">${errs}</ul>` : ''}
       ${warns ? `<ul>${warns}</ul>` : ''}
-      ${rows ? `<table><thead><tr><th>云中心</th><th>主岗</th><th>备岗</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+      ${rows ? `<table><thead><tr><th>云中心</th><th>顺延链（主岗 → 备岗 → 后续列）</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
       ${r.rows.length > 8 ? `<p class="hint">仅显示前 8 行，共 ${r.rows.length} 行</p>` : ''}`;
   }
 
@@ -1050,11 +1298,9 @@
   }
 
   function resetCenters() {
-    const builtin = BUILTIN_CENTERS.map((c) => ({
-      center: c.center,
-      primary: c.primary,
-      backup: c.backup,
-      backups: [c.backup].filter(Boolean),
+    const builtin = BUILTIN_CENTERS.map((c) => makeCenterRow(c.center, {
+      primary: [c.primary],
+      backup: [c.backup],
     }));
     CENTERS.splice(0, CENTERS.length, ...builtin);
     rebuildConfig();
@@ -1215,27 +1461,60 @@
 
     const plan = [];
     const missing = [];
+    const needPick = [];
     for (const row of rows) {
       const target = resolveTarget(row);
       if (target.user) {
-        plan.push({ row, user: target.user, fallback: !!target.fallback, primary: target.primary, manual: !!target.manual });
+        plan.push({
+          row,
+          user: target.user,
+          fallback: !!target.fallback,
+          step: target.step || 0,
+          primary: target.primary,
+          manual: !!target.manual,
+        });
+      } else if (target.reason === 'all-disabled') {
+        needPick.push({ row, target });
       } else {
         missing.push({ row, reason: target.reason, primary: target.primary });
+      }
+    }
+
+    // 一条链上的人都停用了：按云中心汇总，让用户手动选（只对本次生效）
+    if (needPick.length) {
+      const byCenter = new Map();
+      for (const item of needPick) {
+        const center = item.target.center || '（工单没填云中心）';
+        if (!byCenter.has(center)) {
+          byCenter.set(center, { center, ids: [], rows: [], chain: item.target.chain || [] });
+        }
+        const g = byCenter.get(center);
+        g.ids.push(item.row.__id);
+        g.rows.push(item.row);
+      }
+      const picked = await openManualPicker([...byCenter.values()]);
+      if (!picked) return;
+      for (const g of byCenter.values()) {
+        const user = picked.get(g.center);
+        if (!user) {
+          toast(`「${g.center}」还没选处理人`, true);
+          return;
+        }
+        for (const row of g.rows) {
+          plan.push({ row, user, fallback: false, step: 0, primary: g.chain[0], manual: true });
+        }
       }
     }
 
     if (missing.length) {
       const list = missing.map((m) => {
         const head = `${escapeHtml(m.row.__id)} ${escapeHtml(m.row.__title)}`;
-        if (m.reason === 'no-backup') {
-          return `<li>${head} —— 主岗 ${escapeHtml(m.primary)} 已停用，但云中心「${escapeHtml(m.row['云中心'] || '未知')}」没有配置备岗</li>`;
-        }
-        return `<li>${head} —— 未命中任何规则</li>`;
+        return `<li>${head} —— 云中心「${escapeHtml(m.row['云中心'] || '未知')}」在表格里没有任何负责人</li>`;
       }).join('');
       const html = `
         <p class="warn">以下 ${missing.length} 张工单无法确定处理人员：</p>
         <ul>${list}</ul>
-        <p>请在脚本配置区的 rules / backups 中补充后再试。</p>
+        <p>请到「配置 → 数据源」把对应云中心的负责人补上，或在「云中心指派」里手动指定。</p>
       `;
       await openConfirm(html, { showOk: false, cancelText: '知道了' });
       return;
@@ -1249,13 +1528,16 @@
     }
     const desc = CONFIG.description;
 
-    const rowsHtml = plan.map((p) => `
+    const rowsHtml = plan.map((p) => {
+      const tag = p.manual ? '（手动选）' : p.fallback ? `（顺延第 ${p.step + 1} 位）` : '';
+      return `
       <tr>
         <td>${escapeHtml(p.row.__id)}</td>
         <td>${escapeHtml(p.row.__title)}</td>
-        <td>${escapeHtml(displayName(p.user))}${p.manual ? '（手动指派）' : p.fallback ? '（备岗）' : ''}</td>
+        <td>${escapeHtml(displayName(p.user))}${tag}</td>
       </tr>
-    `).join('');
+    `;
+    }).join('');
 
     const groupSummary = [...groups.entries()]
       .map(([user, items]) => `<li>${escapeHtml(displayName(user))}：${items.length} 张</li>`)
