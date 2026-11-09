@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单自动转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.6.0
+// @version      1.6.1
 // @description  勾选工单后，按规则表自动匹配处理人员（回收主/备岗或一般变更二线主/备岗顺延），都停用时弹窗手选，一键完成批量转派
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
@@ -997,9 +997,23 @@
   }
 
   /**
+   * 手选下拉的排序：先按这个云中心在表格里的真实顺序（回收主岗 → 回收备岗 →
+   * 一般变更二线主岗 → 备岗，去重后按第一次出现的先后），再把表格里没写的人接在后面。
+   * 这样「3. 李新勇」就是他在表格里排第 3 个被填进去的人。
+   */
+  function pickerOrder(center, fallbackChain) {
+    const row = CENTERS.find((c) => c.center === center);
+    const listed = row
+      ? dedupeAccounts([...(row.recallChain || []), ...(row.generalChain || [])])
+      : dedupeAccounts(fallbackChain || []);
+    const rest = Object.keys(PEOPLE).filter((acc) => !listed.includes(acc));
+    return [...listed, ...rest];
+  }
+
+  /**
    * 手动选人弹窗（一组负责人全被停用时用）。
    * groups = [{ center, ids: ['RQ...','RQ...'], chain: [...], recalled: bool }]
-   * 下拉里按 PEOPLE 的顺序标好「顺位」，最后一位（唐磊）标「默认」并预选。
+   * 下拉里按表格里的真实顺位编号，唐磊标「默认」并预选。
    * 返回 Map(云中心 → 账号)；用户取消返回 null。
    */
   function openManualPicker(groups) {
@@ -1018,12 +1032,14 @@
       recallCount
         ? `<br>其中 <b>${recallCount}</b> 个是<b>已回收</b>的云中心（权限回收主/备岗都停用了），不会再顺延到「一般变更二线」。`
         : '',
-      `<br>下拉里的数字是人员顺位，最后一位（${displayName(defaultAccount)}）标为<b>默认</b>且已预选，直接点「开始转派」也可以。`,
+      `<br>下拉里的数字是这个人在该云中心表格里的<b>顺位</b>（按「回收主岗 → 回收备岗 → 一般变更二线主岗 → 备岗」的先后，1 最早），表格里没写的人排在后面。`,
+      `<br>${displayName(defaultAccount)} 标为<b>默认</b>且已预选，直接点「开始转派」也可以。`,
     ].join('');
 
     const selects = new Map();
     body.innerHTML = '';
     for (const g of groups) {
+      const order = pickerOrder(g.center, g.chain);
       const tr = document.createElement('tr');
       const c1 = document.createElement('td');
       c1.textContent = g.center;
@@ -1035,7 +1051,7 @@
       blank.value = '';
       blank.textContent = '请选择…';
       sel.appendChild(blank);
-      accounts.forEach((acc, i) => {
+      order.forEach((acc, i) => {
         const opt = document.createElement('option');
         opt.value = acc;
         opt.textContent = `${i + 1}. ${PEOPLE[acc]}（${acc}）${acc === defaultAccount ? ' · 默认' : ''}`;
