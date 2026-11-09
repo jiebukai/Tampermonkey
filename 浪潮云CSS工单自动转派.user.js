@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         浪潮云 CSS 工单自动转派
 // @namespace    https://css.cloud.inspur.com/
-// @version      1.5.0
-// @description  勾选工单后，按规则表自动匹配处理人员（主岗 → 备岗 → 顺延负责人），一键完成批量转派
+// @version      1.6.0
+// @description  勾选工单后，按规则表自动匹配处理人员（回收主/备岗或一般变更二线主/备岗顺延），都停用时弹窗手选，一键完成批量转派
 // @author       jiebukai
 // @match        https://css.cloud.inspur.com/platform/*
 // @run-at       document-idle
@@ -365,13 +365,16 @@
   function makeCenterRow(center, cols) {
     const clean = {};
     for (const key of CHAIN_COLUMNS) clean[key] = dedupeAccounts(cols && cols[key]);
-    const chain = [];
-    for (const key of CHAIN_COLUMNS) {
-      for (const acc of clean[key]) if (!chain.includes(acc)) chain.push(acc);
-    }
+    // 两段链：已回收（权限回收主备岗）/ 未回收（一般变更二线主备岗）
+    const recallChain = dedupeAccounts([...clean.recallPrimary, ...clean.recallBackup]);
+    const generalChain = dedupeAccounts([...clean.primary, ...clean.backup]);
+    // chain 只用于展示和保存（两段拼起来、跨段去重）
+    const chain = dedupeAccounts([...recallChain, ...generalChain]);
     return {
       center: String(center == null ? '' : center).trim(),
       chain,
+      recallChain,
+      generalChain,
       cols: clean,
       primary: chain[0] || '',
       backup: chain[1] || '',
@@ -676,11 +679,7 @@
     return hit ? hit.user : null;
   }
 
-  /**
-   * 决定一张工单该转给谁。
-   * 主岗启用 -> 主岗；主岗停用 -> 该云中心的备岗；都没有 -> null
-   */
-  /** 某个云中心的顺延链（找不到就退回「主岗 + 备岗」的老规则） */
+  /** 某个云中心的完整顺延链（展示用；找不到就退回「主岗 + 备岗」的老规则） */
   function centerChain(center) {
     const name = (center || '').trim();
     if (!name) return [];
@@ -692,26 +691,46 @@
 
   /**
    * 决定一张工单该转给谁。
-   * 先看手动指派 overrides；否则沿顺延链（主岗 → 备岗 → 表格后面的列）
-   * 找第一个「没被停用」的人；全都被停用就返回 null，交给调用方让用户手动选。
+   * 先看手动指派 overrides；否则在「同一类」负责人里顺延：
+   *   - 已回收的云中心（权限回收主/备岗有值）：只在这两列里顺延，都停用了直接让人手选，
+   *     不再跳到「一般变更二线」——那两列是未回收云中心的负责人，不该接已回收的单。
+   *   - 未回收的云中心：在「一般变更二线主/备岗」里顺延，都停用了同样让人手选。
    */
   function resolveTarget(row) {
     const center = (row['云中心'] || '').trim();
     const manual = center && overrides[center];
     if (manual) return { user: manual, manual: true, center };
 
-    const chain = centerChain(center);
-    const ruleUser = matchUser(row);
-    const list = chain.length ? chain : dedupeAccounts([ruleUser]);
+    const meta = CENTERS.find((c) => c.center === center);
+    const recall = dedupeAccounts(meta ? meta.recallChain : []);
+    const general = dedupeAccounts(meta ? meta.generalChain : []);
+    const recalled = recall.length > 0;
+    let list = recalled ? recall : general;
+
+    if (!list.length) {
+      // 兼容老的内置表 / 只有 rules 的情况
+      const chain = centerChain(center);
+      list = chain.length ? chain : dedupeAccounts([matchUser(row)]);
+    }
     if (!list.length) return { user: null, reason: 'no-rule', center };
 
     const hit = walkChain(list, (u) => disabledUsers.has(u));
-    if (!hit.user) return { user: null, reason: 'all-disabled', center, chain: list, primary: list[0] };
+    if (!hit.user) {
+      return {
+        user: null,
+        reason: recalled ? 'recall-all-disabled' : 'all-disabled',
+        center,
+        chain: list,
+        recalled,
+        primary: list[0],
+      };
+    }
 
     return {
       user: hit.user,
       primary: list[0],
       chain: list,
+      recalled,
       step: hit.step,
       fallback: hit.step > 0,
       center,
@@ -978,8 +997,9 @@
   }
 
   /**
-   * 手动选人弹窗（一条顺延链上的人全被停用时用）。
-   * groups = [{ center, ids: ['RQ...','RQ...'], chain: [...] }]
+   * 手动选人弹窗（一组负责人全被停用时用）。
+   * groups = [{ center, ids: ['RQ...','RQ...'], chain: [...], recalled: bool }]
+   * 下拉里按 PEOPLE 的顺序标好「顺位」，最后一位（唐磊）标「默认」并预选。
    * 返回 Map(云中心 → 账号)；用户取消返回 null。
    */
   function openManualPicker(groups) {
@@ -987,8 +1007,19 @@
     const mask = shadow.getElementById('pickMask');
     const body = shadow.getElementById('pickBody');
     const total = groups.reduce((n, g) => n + g.ids.length, 0);
-    shadow.getElementById('pickHint').innerHTML =
-      `有 <b>${groups.length}</b> 个云中心（共 <b>${total}</b> 张工单）的负责人全部被停用了，请手动选择处理人员：`;
+    const accounts = Object.keys(PEOPLE);
+    const defaultAccount = accounts.includes('tanglei01')
+      ? 'tanglei01'
+      : (accounts[accounts.length - 1] || '');
+    const recallCount = groups.filter((g) => g.recalled).length;
+
+    shadow.getElementById('pickHint').innerHTML = [
+      `有 <b>${groups.length}</b> 个云中心（共 <b>${total}</b> 张工单）的负责人全部被停用了，请手动选择处理人员：`,
+      recallCount
+        ? `<br>其中 <b>${recallCount}</b> 个是<b>已回收</b>的云中心（权限回收主/备岗都停用了），不会再顺延到「一般变更二线」。`
+        : '',
+      `<br>下拉里的数字是人员顺位，最后一位（${displayName(defaultAccount)}）标为<b>默认</b>且已预选，直接点「开始转派」也可以。`,
+    ].join('');
 
     const selects = new Map();
     body.innerHTML = '';
@@ -1004,12 +1035,14 @@
       blank.value = '';
       blank.textContent = '请选择…';
       sel.appendChild(blank);
-      for (const [acc, name] of Object.entries(PEOPLE)) {
+      accounts.forEach((acc, i) => {
         const opt = document.createElement('option');
         opt.value = acc;
-        opt.textContent = `${name}（${acc}）`;
+        opt.textContent = `${i + 1}. ${PEOPLE[acc]}（${acc}）${acc === defaultAccount ? ' · 默认' : ''}`;
+        if (acc === defaultAccount) opt.selected = true;
         sel.appendChild(opt);
-      }
+      });
+      sel.value = defaultAccount;
       c3.appendChild(sel);
       tr.append(c1, c2, c3);
       body.appendChild(tr);
@@ -1152,6 +1185,16 @@
     });
   }
 
+  /** 一行负责人的展示文案：已回收的云中心拆成两段显示 */
+  function chainLabel(row) {
+    const recall = dedupeAccounts(row && row.recallChain);
+    const general = dedupeAccounts(row && row.generalChain);
+    const r = recall.map((a) => displayName(a)).join(' → ');
+    const g = general.map((a) => displayName(a)).join(' → ');
+    if (recall.length && general.length) return `回收：${r} ｜ 一般变更：${g}`;
+    return r || g || '';
+  }
+
   function renderCenters() {
     const list = shadow.getElementById('cfgCenters');
     const countEl = shadow.getElementById('cfgCenterCount');
@@ -1181,8 +1224,9 @@
       const options = accounts.map((acc) =>
         `<option value="${escapeHtml(acc)}" ${current === acc ? 'selected' : ''}>${escapeHtml(displayName(acc))}</option>`
       ).join('');
-      const chainText = (c.chain && c.chain.length ? c.chain : [c.primary, c.backup].filter(Boolean))
-        .map((acc) => displayName(acc)).join(' → ');
+      const chainText = chainLabel(c)
+        || (c.chain && c.chain.length ? c.chain : [c.primary, c.backup].filter(Boolean))
+          .map((acc) => displayName(acc)).join(' → ');
       return `
         <div class="center-row ${current ? 'manual' : ''}" data-center="${escapeHtml(c.center)}">
           <span class="c">${highlightMatch(c.center, kw)}<br><span class="chain">${escapeHtml(chainText || '（未配置负责人）')}</span></span>
@@ -1228,7 +1272,7 @@
     const errs = r.errors.slice(0, 8).map((e) => `<li>${escapeHtml(e)}</li>`).join('');
     const warns = r.warnings.slice(0, 6).map((w) => `<li>${escapeHtml(w)}</li>`).join('');
     const rows = r.rows.slice(0, 8).map((x) => {
-      const chain = (x.chain || []).map((a) => displayName(a)).join(' → ');
+      const chain = chainLabel(x) || (x.chain || []).map((a) => displayName(a)).join(' → ');
       return `<tr><td>${escapeHtml(x.center)}</td><td>${escapeHtml(chain || '—')}</td></tr>`;
     }).join('');
     const headline = r.errors.length
@@ -1237,7 +1281,7 @@
     return `${headline}
       ${errs ? `<ul class="warn">${errs}</ul>` : ''}
       ${warns ? `<ul>${warns}</ul>` : ''}
-      ${rows ? `<table><thead><tr><th>云中心</th><th>顺延链（主岗 → 备岗 → 后续列）</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+      ${rows ? `<table><thead><tr><th>云中心</th><th>顺延链（回收：主岗 → 备岗 ｜ 未回收：一般变更二线主岗 → 备岗）</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
       ${r.rows.length > 8 ? `<p class="hint">仅显示前 8 行，共 ${r.rows.length} 行</p>` : ''}`;
   }
 
@@ -1473,7 +1517,7 @@
           primary: target.primary,
           manual: !!target.manual,
         });
-      } else if (target.reason === 'all-disabled') {
+      } else if (target.reason === 'all-disabled' || target.reason === 'recall-all-disabled') {
         needPick.push({ row, target });
       } else {
         missing.push({ row, reason: target.reason, primary: target.primary });
@@ -1486,7 +1530,13 @@
       for (const item of needPick) {
         const center = item.target.center || '（工单没填云中心）';
         if (!byCenter.has(center)) {
-          byCenter.set(center, { center, ids: [], rows: [], chain: item.target.chain || [] });
+          byCenter.set(center, {
+            center,
+            ids: [],
+            rows: [],
+            chain: item.target.chain || [],
+            recalled: !!item.target.recalled,
+          });
         }
         const g = byCenter.get(center);
         g.ids.push(item.row.__id);
